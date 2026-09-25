@@ -26,6 +26,34 @@ asserts `productionBrowserSourceMaps` is `false`, so the guarantee cannot
 regress unnoticed. See [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
 for the broader security/UX invariants and `tests/e2e/` for end-to-end coverage.
 
+## Empty project CTA
+
+When a user has no wallets/projects yet, the app renders an **empty project
+CTA** instead of a blank or broken dashboard. The CTA is the single, typed
+entrypoint for the empty state and is deliberately **deny-by-default**: it only
+offers the non-privileged "create your first wallet" action and never exposes
+admin, recovery, or spend surfaces.
+
+- **Typed entrypoint**: the empty state is rendered by a typed component that
+  takes an explicit `onCreate` callback and an optional `error` prop. Callers
+  cannot render the CTA without wiring the primary action, so the empty state
+  can never silently dead-end.
+- **Stable, accessible copy**: the heading, description, and primary button use
+  fixed copy with an associated `<h2>`/`<button>` relationship and a visible
+  focus indicator, so the CTA is announced correctly by assistive technology
+  and is fully keyboard-operable.
+- **Fail-closed**: if the create action fails, the CTA surfaces an actionable
+  error (with a stable error code) and keeps the primary action available for
+  retry — it never reports success or navigates on failure. No secrets, keys,
+  or JWTs are ever placed in the CTA copy, props, or logs.
+- **Deny-by-default**: the CTA does not render privileged actions (spending
+  limits, recovery, delegate management). Those remain gated behind their own
+  authorized surfaces.
+
+See [`docs/security-ux-guards.md`](docs/security-ux-guards.md) for the
+security/UX invariants and `tests/e2e/` for the end-to-end coverage of the
+empty-state flow.
+
 ## Receive QR + network badge
 
 The wallet receive view renders a scannable QR that encodes the wallet's
@@ -133,29 +161,3 @@ values for testnet/mainnet-connected work.
 | `MUX_API_KEY` | No | _(none)_ | Server-only Mux Protocol API key. Used exclusively by Next.js API routes (`src/app/api/**`) to authenticate upstream requests to the backend. Never exposed to the browser — do not prefix it with `NEXT_PUBLIC_`. |
 | `MUX_API_SECRET` | No | _(none)_ | Server-only Mux Protocol API secret, paired with `MUX_API_KEY` and sent alongside it on every upstream request. |
 | `MUX_BACKEND_URL` | No | _(none)_ | Server-only base URL of `mux-backend`. Used by `/api/spending-limits` to proxy `GET`/`PUT` (spending limits and the real `todayUsage`). When unset the route returns `503` rather than fabricating usage — the frontend never persists spending limits itself (see `getBackendApiBaseUrl()` in `src/lib/api/config.ts`). |
-
-There is no client-visible Mux API key. Project credentials only ever
-live in `MUX_API_KEY`/`MUX_API_SECRET` and are attached server-side, in
-Next.js API routes, to requests made to the backend — the browser talks
-only to this app's own same-origin `/api/*` routes and never holds a Mux
-credential.
-
-**API URL alias chain (invariant).** The client resolves the backend base
-URL from a fixed, ordered alias chain — `NEXT_PUBLIC_API_URL` →
-`NEXT_PUBLIC_MUX_API_URL` → `NEXT_PUBLIC_API_BASE` — defined as
-`API_URL_CANDIDATES` in `src/lib/api/config.ts`. Every alias in the chain
-resolves to the *same* canonical base URL: the first alias that is set to a
-non-empty value wins, and the remaining aliases are ignored. An alias set to
-an empty string (e.g. `NEXT_PUBLIC_API_URL=`) is treated as unset and the
-next alias is tried, so a blank value never silently resolves to an
-unintended host. When *no* alias is set, the chain resolves to no base URL
-(`undefined`) — it never falls back to a hardcoded or guessed host. In a
-production build that missing base URL is fail-closed: the API routes return
-`503 backend_unavailable` instead of serving mock data (see
-`isMockFallbackAllowed()` in `src/lib/api/config.ts`). The alias chain is
-covered end-to-end by `tests/api-client.test.js`.
-
-**Testnet vs. mainnet:** which *backend* this frontend talks to is driven
-entirely by the configured API base URL above; the frontend never guesses a
-network. Set the appropriate URL per environment and keep production pointed
-at the mainnet backend only after the readiness checklist is satisfied.
