@@ -3,6 +3,29 @@
 Mux Protocol provides invisible wallets and account abstraction on Stellar/Soroban.
 This repository contains the Mux frontend.
 
+## Source maps production policy
+
+Source maps are a **development-only** affordance. Shipping readable source maps
+to production would expose internal module structure, comments, and any
+accidentally-inlined values to anyone who opens devtools — an information
+disclosure risk on a wallet/AA surface. The policy is therefore **fail-closed**:
+production builds never emit browser source maps.
+
+- **Production (`NODE_ENV=production`):** browser source maps are **disabled**.
+  `next.config.ts` sets `productionBrowserSourceMaps: false`, so no `.map` files
+  are emitted and devtools cannot reconstruct the original sources.
+- **Development / test:** source maps are **enabled** (Next.js default) so
+  contributors get readable stack traces and can debug locally.
+- **Fail-closed:** the setting is pinned to `false` in the config rather than
+  left to an environment variable, so a misconfigured deploy cannot silently
+  turn production source maps back on. Any future change to this setting must
+  update the policy here and the gating test below.
+
+This policy is enforced by an automated test (`tests/ci-workflow.test.ts`) that
+asserts `productionBrowserSourceMaps` is `false`, so the guarantee cannot
+regress unnoticed. See [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
+for the broader security/UX invariants and `tests/e2e/` for end-to-end coverage.
+
 ## Receive QR + network badge
 
 The wallet receive view renders a scannable QR that encodes the wallet's
@@ -133,103 +156,6 @@ production build that missing base URL is fail-closed: the API routes return
 covered end-to-end by `tests/api-client.test.js`.
 
 **Testnet vs. mainnet:** which *backend* this frontend talks to is driven
-entirely by `NEXT_PUBLIC_API_URL` (or its aliases above) — point it at a
-testnet-configured Mux backend for staging/testnet work, and at the
-production backend for mainnet. Separately, the dashboard has an in-app
-Testnet/Mainnet switcher (`NetworkContext`, in the top nav) that scopes
-which network's wallets are fetched *within* that backend — `useWallets`
-sends it as a `?network=` query param on `/api/wallets`, so wallets are
-never double-filtered by both a server-side scope and an independent
-client-side one. The env var picks the backend; the in-app switcher picks
-the network within it. The CI workflow (`.github/workflows/ci.yml`) sets a
-placeholder `NEXT_PUBLIC_API_URL` only so `next build` can run without
-secrets; it does not reflect a real environment.
-
-**NetworkContext scopes the wallets query only.** `NetworkContext`
-(`src/contexts/NetworkContext.tsx`) is the single source of truth for the
-active network and exposes a typed, stable API — `network` (`'testnet' |
-'mainnet'`), `chain` (`'stellar-testnet' | 'stellar-mainnet'`),
-`isMainnet`/`isTestnet`, and `setNetwork`. Only the wallets query is scoped
-by it: `useWallets` reads the active network from `NetworkContext` and
-sends it as the `?network=` param on `/api/wallets`, so cross-network
-wallet data can never leak into or be queried from the wrong network.
-Other data hooks (overview, transactions, notifications, analytics) are
-**not** network-scoped by `NetworkContext` and must not assume it — they
-follow the backend selected by `NEXT_PUBLIC_API_URL`. This keeps the
-network scope in exactly one place instead of being applied inconsistently
-across the app.
-
-**Network selection persistence (invariant).** The active network is
-persisted across page reloads and sessions through a typed, validated
-storage layer (`src/lib/network/storage.ts`), keyed by
-`NETWORK_STORAGE_KEY`. Reads and writes go through `readPersistedNetwork()`
-and `writePersistedNetwork()`, which return a discriminated result with
-stable error codes (`network_storage_unavailable`,
-`network_storage_invalid`, `network_storage_write_failed`) and a
-correlation id — never a thrown exception and never a silent default.
-`NetworkContext` hydrates from this layer on mount and writes back on every
-`setNetwork`, so the selection survives reloads without the UI guessing.
-
-Persistence is **fail-closed**: an unknown, malformed, or unsupported
-persisted value is rejected and the context falls back to the documented
-default network (`testnet`) — it never silently defaults to `mainnet`. If
-storage is unavailable (e.g. disabled `localStorage`, SSR, or a quota
-error), the read returns `network_storage_unavailable` and the context uses
-the in-memory default for the session rather than failing the app; a failed
-write surfaces `network_storage_write_failed` and leaves the in-memory
-selection intact. In every case the persisted value is treated as a *hint*
-for the UI only.
-
-**Server remains the source of truth.** The persisted network is a
-client-side UI preference and cannot bypass server-side policy: every
-network-scoped request still carries the `?network=` param and is
-authorized/validated by the backend, which remains authoritative for
-spends, recovery, and admin. A tampered or stale persisted value can at
-most change which network's wallets the UI *asks* for — it can never grant
-access, move funds, or override a server decision. The storage layer is
-covered by unit tests for the valid, invalid, and unavailable paths.
-
-**Fail-closed on network misconfiguration.** The wallets query only runs
-against a known, supported network. If `NetworkContext` is missing, or the
-active network is unknown/unsupported, `useWallets` does not issue a
-request and surfaces a stable error code (`network_unconfigured` /
-`unsupported_network`) with a correlation id rather than falling back to a
-default network — so a testnet/mainnet misconfig can never silently query
-the wrong network's wallets. The same fail-closed rule applies when the
-backend is unreachable: the wallets query errors out instead of returning
-cross-network or fabricated data.
-
-**Production defaults:** when `NODE_ENV=production`, unset vars with a
-documented default (e.g. `NEXT_PUBLIC_MUX_API_URL` →
-`https://api.muxprotocol.com`) are applied automatically by `getEnv()`,
-so a production dep
----
-
-## Commit messages and `.git_msg`
-
-`.git_msg` is an **optional** local file used to pre-fill a commit message
-when you don't want to pass `-m` on the command line. It is **not**
-required to commit, and it is **not** read by CI — the repository works
-fine whether or not the file exists.
-
-* **Optional:** if `.git_msg` is absent, commits proceed normally; nothing
-  in the build, CI, or hooks depends on it.
-* **Purpose:** convenience only — a scratch file for staging a commit
-  message locally before running `git commit`.
-* **Format:** plain UTF-8 text. The first line is treated as the commit
-  subject; subsequent lines are the body. Keep it short and conventional
-  (e.g. `fix: clarify .git_msg optional`).
-* **Not committed:** `.git_msg` is a local convenience file and should not
-  be committed to the repository. Do not put secrets, tokens, or
-  credentials in it.
-
-If you prefer, just use `git commit -m "<message>"` — `.git_msg` is never
-required.
-
----
-
-## References
-
-- [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
-- [`tests/e2e/`](tests/e2e/)
-
+entirely by the configured API base URL above; the frontend never guesses a
+network. Set the appropriate URL per environment and keep production pointed
+at the mainnet backend only after the readiness checklist is satisfied.
