@@ -62,6 +62,82 @@ maps to production is a security and IP risk, so the policy is **fail closed**.
   requires a design note, a private upload target, and a documented rollback in
   the PR description.
 
+## Settings danger zone confirm phrase
+
+The Settings danger zone hosts destructive, irreversible actions (for example
+account/wallet deletion and recovery reset). These actions are gated behind a
+typed confirm-phrase guard so a stray click or a scripted request cannot trigger
+them. The guard is **fail closed**: the destructive action stays disabled until
+the exact phrase is entered.
+
+### Confirm phrase contract
+
+- The required phrase is a fixed, documented constant (for example
+  `DELETE MY ACCOUNT`). It is never derived from user input or remote config.
+- Matching is **case-insensitive** and **whitespace-normalized**: leading and
+trailing whitespace is trimmed and internal runs of whitespace collapse to a
+single space before comparison. No other normalization (no unicode folding, no
+punctuation stripping) is applied.
+- The guard exposes a typed entrypoint that returns a discriminated result.
+  Callers must branch on the state code, never on message text.
+
+### Typed states and error codes
+
+| Code | Meaning |
+| --- | --- |
+| `DANGER_CONFIRM_OK` | Phrase matches; the destructive action may proceed. |
+| `DANGER_CONFIRM_EMPTY` | Input is empty or whitespace-only. |
+| `DANGER_CONFIRM_MISMATCH` | Input does not match the required phrase. |
+| `DANGER_CONFIRM_TOO_LONG` | Input exceeds the maximum accepted length. |
+| `DANGER_CONFIRM_LOCKED` | Guard is locked (in-flight or rate-limited); retry later. |
+
+Every evaluation carries a correlation id propagated to logs and the
+user-facing error surface so support can trace a single attempt.
+
+### Fail-closed behavior
+
+- The destructive action is **disabled** unless the guard returns
+  `DANGER_CONFIRM_OK`. Empty, mismatched, oversized, or locked input keeps it
+  disabled.
+- The guard is the only path to the destructive handler. The handler must
+  re-validate the confirm result server-side; a client cannot bypass policy by
+  invoking the handler directly.
+- Inputs longer than the maximum accepted length are rejected with
+  `DANGER_CONFIRM_TOO_LONG` before any comparison, so adversarial oversized
+  input cannot be used to grief the surface.
+
+### Edge cases and failure modes
+
+- **Replay / concurrency:** confirmation is single-use. Once a destructive
+  action is confirmed it is consumed; replayed or concurrent confirmations for
+  the same action fail closed with `DANGER_CONFIRM_LOCKED` and must not trigger
+  a second write.
+- **Dependency outage:** if the server cannot validate the confirmation, the
+  action fails closed; the client never proceeds on a degraded dependency.
+- **Auth expiry / wrong role / revoked delegate:** the destructive action
+  requires an authorized owner session. Expired sessions or revoked delegates
+  fail closed and prompt re-auth; the confirm phrase never substitutes for
+  authorization.
+- **Adversarial input:** oversized or malformed input is rejected before
+  comparison; rate-limit confirmation attempts per session and per IP.
+- **Testnet vs mainnet:** the guard applies identically on both; a mainnet
+  destructive action is never unlocked by a testnet confirmation.
+
+### Observability
+
+- Emit structured logs with the correlation id, the resolved state code, and
+  the action identifier. Never log the entered phrase, raw key material, JWTs,
+  or webhook secrets.
+- Track confirmation success/failure counts and lock events so ops can alert on
+  abuse or repeated mismatches.
+
+### Rollout and rollback
+
+- Changes to the danger-zone guard that touch money paths or mainnet behavior
+  must land behind a feature flag or kill-switch.
+- Document the rollback path in the PR description: disabling the flag must
+  restore the previous behavior without data migration.
+
 ## Wallet detail deep links
 
 Wallet detail views are addressable via deep links so that support, ops, and
@@ -173,60 +249,4 @@ must present a valid session (JWT) and hold one of the following roles for the
 requested account:
 
 - **owner** — full access to their own activity.
-- **delegate** — access only while the delegation is active and not revoked.
-- **guardian** — access only for accounts they guard.
-- **API key** — scoped to the accounts and actions granted to the key.
-
-Requests with an expired session, wrong role, or revoked delegate are rejected
-with `ACTIVITY_UNAUTHORIZED` (deny by default). Authorization is re-evaluated on
-every page request; a cursor does not carry or extend authorization.
-
-### Error codes
-
-| Code | Meaning |
-| --- | --- |
-| `ACTIVITY_INVALID_LIMIT` | `limit` missing, non-integer, or out of range. |
-| `ACTIVITY_INVALID_CURSOR` | Cursor malformed, tampered, or expired. |
-| `ACTIVITY_UNAUTHORIZED` | Missing/expired session, wrong role, or revoked delegate. |
-| `ACTIVITY_DEPENDENCY_UNAVAILABLE` | Upstream RPC/DB/Horizon outage; fail closed. |
-
-Errors are actionable and never include raw key material, JWTs, or webhook
-secrets. Each response carries a correlation id for support and tracing.
-
-### Idempotency & concurrency
-
-- Read requests are safe to retry; a repeated request with the same cursor
-  returns the same page.
-- Concurrent requests with the same cursor do not advance shared state.
-- Writes triggered from the feed (e.g. retry/claim actions) require an
-  idempotency key and are rejected on replay.
-
-### Observability
-
-- Emit metrics for request count, latency, and error code on the activity feed
-  path.
-- Log correlation ids and error codes only; never log cursors, tokens, keys, or
-  full request bodies.
-
-### Environment safety
-
-- Testnet and mainnet configurations are distinct; a mainnet-affecting change to
-  the feed must be gated behind a feature flag or kill-switch with a documented
-  rollback.
-- Misconfigured environments fail closed rather than serving cross-environment
-  data.
-
-## Notification preferences
-
-The notification preferences page is a privileged surface: it reads and writes
-per-account delivery settings (channels and event subscriptions). Reads and
-writes must be authorized and fail closed.
-
-### Request contract
-
-- `channels` — object keyed by channel (`email`, `push`, `webhook`), each with a
-  boolean `enabled` flag. Unknown channels are rejected with
-  `NOTIFICATIONS_INVALID_CHANNEL`.
-- `events` — object keyed by event type (e.g. `payment.re
-
-/* … truncated 10224 chars — edit only what you need near the top … */
+- **delegate** — access only while the delegation is active and

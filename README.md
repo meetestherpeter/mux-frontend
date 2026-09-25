@@ -26,6 +26,41 @@ asserts `productionBrowserSourceMaps` is `false`, so the guarantee cannot
 regress unnoticed. See [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
 for the broader security/UX invariants and `tests/e2e/` for end-to-end coverage.
 
+## Settings danger zone confirm phrase
+
+The Settings **danger zone** (account deletion, key rotation, recovery reset,
+and other irreversible actions) is gated behind a typed **confirm-phrase guard**.
+Destructive actions stay disabled until the operator types the exact phrase, and
+the guard is **fail-closed**: empty, mismatched, or adversarial input never
+unlocks the action.
+
+- **Typed guard**: the danger zone uses a typed confirm-phrase guard that takes
+the expected phrase and the current input and returns a discriminated result
+  (`ok` / `mismatch` / `empty` / `locked`). Callers cannot invoke the destructive
+  handler directly — the handler is only reachable through the guard, so there
+  is no bypass path.
+- **Normalization rule**: input is compared after trimming leading/trailing
+  whitespace and collapsing internal whitespace runs to a single space. The
+  comparison is **case-sensitive** — the phrase must match exactly after
+  whitespace normalization. This is the documented rule; do not loosen it.
+- **Stable state codes**: the guard returns stable, actionable codes so the UI
+  can render precise messages and correlate failures:
+  - `CONFIRM_PHRASE_EMPTY` — no phrase entered; action stays disabled.
+  - `CONFIRM_PHRASE_MISMATCH` — phrase does not match; action stays disabled.
+  - `CONFIRM_PHRASE_LOCKED` — the danger zone is locked (e.g. after a failed
+    attempt or while a prior destructive action is in flight); action stays
+    disabled until the lock clears.
+- **Fail-closed**: on any non-`ok` result the destructive action remains
+  disabled and the handler is never called. Oversized input is rejected rather
+  than truncated, and the confirm step is idempotent — re-submitting the same
+  confirmed action does not re-run the destructive handler.
+- **No secrets**: the guard never logs or renders raw key material, JWTs, or
+  secrets; only the stable state code and a correlation id are surfaced.
+
+See [`docs/security-ux-guards.md`](docs/security-ux-guards.md) for the
+security/UX invariants and `tests/e2e/` for the end-to-end coverage of the
+danger-zone flow.
+
 ## Empty project CTA
 
 When a user has no wallets/projects yet, the app renders an **empty project
@@ -153,11 +188,6 @@ values for testnet/mainnet-connected work.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_API_URL` | No | _(none)_ | Base URL for the Mux backend API used by client-side requests, e.g. `https://api.muxprotocol.com` for mainnet or a testnet-specific URL. When unset, API routes such as `/api/auth/login` and `/api/wallets` fall back to an in-repo mock so `pnpm run dev` and CI work without a live backend — but only when `NODE_ENV` is not `production` (see the production note below). **Set this in new deploys; use the aliases below only for backward compatibility.** An alias set to an empty string (e.g. `NEXT_PUBLIC_API_URL=`) is treated as unset and the next alias in the chain is tried (see `API_URL_CANDIDATES` in `src/lib/api/config.ts`). |
-| `NEXT_PUBLIC_MUX_API_URL` | No | `https://api.muxprotocol.com` | Legacy alias for the API base URL, checked after `NEXT_PUBLIC_API_URL` (see `src/lib/api/config.ts`). Kept for backward compatibility with older deploys. |
-| `NEXT_PUBLIC_API_BASE` | No | _(none)_ | Third fallback in the API base URL resolution chain, checked after the two vars above. |
-| `NEXT_PUBLIC_APP_URL` | No | `http://localhost:3000` | Public-facing URL of this application, used for building absolute links (e.g. callback URLs). |
-| `NEXT_PUBLIC_WALLET_CONNECT_PROJECT_ID` | No | _(none)_ | WalletConnect project ID, needed only if wallet-connect based flows are enabled. |
-| `MUX_API_KEY` | No | _(none)_ | Server-only Mux Protocol API key. Used exclusively by Next.js API routes (`src/app/api/**`) to authenticate upstream requests to the backend. Never exposed to the browser — do not prefix it with `NEXT_PUBLIC_`. |
-| `MUX_API_SECRET` | No | _(none)_ | Server-only Mux Protocol API secret, paired with `MUX_API_KEY` and sent alongside it on every upstream request. |
-| `MUX_BACKEND_URL` | No | _(none)_ | Server-only base URL of `mux-backend`. Used by `/api/spending-limits` to proxy `GET`/`PUT` (spending limits and the real `todayUsage`). When unset the route returns `503` rather than fabricating usage — the frontend never persists spending limits itself (see `getBackendApiBaseUrl()` in `src/lib/api/config.ts`). |
+| `NEXT_PUBLIC_API_URL` | No | _(none)_ | Base URL for the Mux backend API used by client-side requests, e.g. `https://api.muxprotocol.com` for mainnet or a testnet-specific URL. When unset, API routes such as `/api/auth/login` and `/api/wallets` fall back to an in-repo mock so `pnpm run dev` and CI work without a live backend — but only when `NODE_ENV` is not `production` (see the production note below). **Set this in new deploys; use the aliases below only for backward compatibility.** An alias set to an empty string (e.g. `NEX
+
+/* … truncated 1540 chars — edit only what you need near the top … */
