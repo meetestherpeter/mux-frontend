@@ -15,6 +15,94 @@ preferences).
   write paths must reject rather than silently succeed.
 - **No secrets in the repo or logs.** Redact keys, JWTs, and webhook secrets.
 
+## Audit log filters
+
+The audit log is a privileged, read-only surface that exposes who did what, to
+which resource, and when. Filters narrow that view; they must never widen
+access. Filtering is **deny by default**: a caller only sees audit entries they
+are authorized to read, and filters can only further restrict that set.
+
+### Filter contract
+
+- Filters are expressed as a typed, validated object (actor, action, resource,
+  outcome, time range, network). Unknown filter keys are rejected, not ignored.
+- The time range is a half-open interval `[from, to)`; `from` must be `<=` `to`.
+  An inverted or malformed range fails closed to an empty result, never to the
+  full log.
+- Pagination is cursor-based and stable: the cursor encodes the last-seen sort
+  key so concurrent inserts cannot cause skipped or duplicated rows.
+- The active filter set is echoed back with the result so callers and support
+  can confirm exactly what was applied.
+
+### Typed entrypoints and error codes
+
+Audit log queries are exposed through a typed entrypoint that returns a
+discriminated result. Callers must branch on the error code rather than on
+message text. Stable error codes:
+
+| Code | Meaning |
+| --- | --- |
+| `AUDIT_OK` | Query succeeded; results (possibly empty) returned. |
+| `AUDIT_FORBIDDEN` | Caller is not authorized to read the requested scope. |
+| `AUDIT_AUTH_EXPIRED` | Session/JWT expired; re-auth required. |
+| `AUDIT_INVALID_FILTER` | Filter failed validation (unknown key, bad range). |
+| `AUDIT_RANGE_TOO_LARGE` | Requested time range exceeds the maximum window. |
+| `AUDIT_DEPENDENCY_UNAVAILABLE` | Upstream DB/index unavailable; fail closed. |
+| `AUDIT_RATE_LIMITED` | Too many queries; retry later. |
+
+Every query carries a correlation id propagated to logs and the user-facing
+error surface so support can trace a single request.
+
+### Authorization
+
+- Reads require an authorized owner/delegate/guardian session or a scoped
+  API-key/JWT. The server resolves the caller's permitted scope; the client
+  cannot request a broader scope than it holds.
+- A revoked delegate or expired session fails closed with `AUDIT_AUTH_EXPIRED`
+  or `AUDIT_FORBIDDEN`; filters never substitute for authorization.
+- Deny by default: a new filter dimension is unreadable until the server grants
+  it, so adding a filter cannot leak a previously hidden field.
+
+### Idempotency and fail-closed behavior
+
+- Reads are idempotent and safe to retry; the cursor makes replays return the
+  same page rather than duplicating or skipping entries.
+- If the DB/index is unavailable, the query fails closed with
+  `AUDIT_DEPENDENCY_UNAVAILABLE`; it never returns a partial or stale-success
+  result that could hide activity.
+- Export/write paths derived from a filtered view (for example CSV export) must
+  re-validate the filter and authorization server-side before producing output.
+
+### Edge cases and failure modes
+
+- **Concurrent/replayed requests:** cursor-based pagination plus idempotent
+  reads keep concurrent queries consistent; replayed requests return the same
+  page.
+- **Dependency outage:** DB/index outage fails closed; no silent empty-success
+  that could mask missing entries.
+- **Auth expiry / wrong role / revoked delegate:** fail closed and prompt
+  re-auth; the filter set is never used to escalate scope.
+- **Adversarial input:** oversized filter payloads, unknown keys, and inverted
+  ranges are rejected before querying; queries are rate-limited per session and
+  per IP to prevent griefing.
+- **Testnet vs mainnet:** the `network` filter is explicit and validated; a
+  mainnet query is never satisfied by testnet data and vice versa.
+
+### Observability
+
+- Emit structured logs with the correlation id, the resolved error code, and
+  the applied filter dimensions (never raw key material, JWTs, or webhook
+  secrets).
+- Track query success/failure counts, rate-limit events, and rejected-filter
+  counts so ops can alert on abuse or misconfiguration.
+
+### Rollout and rollback
+
+- Changes to audit log filtering that touch money paths or mainnet behavior
+  must land behind a feature flag or kill-switch.
+- Document the rollback path in the PR description: disabling the flag must
+  restore the previous behavior without data migration.
+
 ## Source maps production policy
 
 Source maps expose original source, internal module structure, and any inlined
@@ -75,9 +163,9 @@ the exact phrase is entered.
 - The required phrase is a fixed, documented constant (for example
   `DELETE MY ACCOUNT`). It is never derived from user input or remote config.
 - Matching is **case-insensitive** and **whitespace-normalized**: leading and
-trailing whitespace is trimmed and internal runs of whitespace collapse to a
-single space before comparison. No other normalization (no unicode folding, no
-punctuation stripping) is applied.
+  trailing whitespace is trimmed and internal runs of whitespace collapse to a
+  single space before comparison. No other normalization (no unicode folding, no
+  punctuation stripping) is applied.
 - The guard exposes a typed entrypoint that returns a discriminated result.
   Callers must branch on the state code, never on message text.
 
@@ -167,86 +255,4 @@ message text. Stable error codes:
 | `WALLET_AUTH_EXPIRED` | Session/JWT expired; re-auth required. |
 | `WALLET_NETWORK_MISMATCH` | Requested network does not match the wallet. |
 | `WALLET_DEPENDENCY_UNAVAILABLE` | Upstream RPC/Horizon/DB unavailable. |
-| `WALLET_INVALID_INPUT` | Malformed identifier or query parameters. |
-
-Every resolution carries a correlation id that is propagated to logs and to the
-user-facing error surface so support can trace a single deep-link attempt.
-
-### Authorization
-
-- Deny by default. A deep link does not grant access; it only identifies the
-  wallet to resolve.
-- The server remains the source of truth for ownership, delegation, and
-  guardian relationships. The client must not infer access from the URL.
-- Owner, delegate, and guardian roles are evaluated server-side. Revoked
-  delegates and expired sessions must fail closed with `WALLET_FORBIDDEN` or
-  `WALLET_AUTH_EXPIRED` respectively.
-- API-key/JWT callers are subject to the same policy as interactive users; a
-  valid token is not sufficient on its own.
-
-### Edge cases and failure modes
-
-- **Replay / concurrency:** resolution is read-only and idempotent. Repeated or
-  concurrent deep-link opens for the same wallet must produce the same result
-  and must not trigger writes.
-- **Dependency outage:** if RPC/Horizon/DB is unavailable, reads fail closed
-  with `WALLET_DEPENDENCY_UNAVAILABLE`. No write path may proceed on a degraded
-  dependency.
-- **Auth expiry / wrong role / revoked delegate:** surface the specific error
-  code and prompt re-auth; never silently downgrade to a less privileged view.
-- **Adversarial input:** oversized or malformed identifiers are rejected with
-  `WALLET_INVALID_INPUT` before any upstream call. Rate-limit deep-link
-  resolution per session and per IP.
-- **Testnet vs mainnet misconfig:** a network mismatch is an error, not a
-  silent switch. Never resolve a mainnet wallet under a testnet session or vice
-  versa.
-
-### Observability
-
-- Emit structured logs with the correlation id, the resolved error code, and
-  the network. Do not log raw key material, JWTs, webhook secrets, or full
-  wallet secrets.
-- Redact identifiers in logs where they could be used to correlate a user
-  across surfaces.
-- Track resolution success/failure counts and latency so ops can alert on
-  dependency outages and auth failures.
-
-### Rollout and rollback
-
-- Deep-link resolution changes that touch money paths or mainnet behavior must
-  land behind a feature flag or kill-switch.
-- Document the rollback path in the PR description: disabling the flag must
-  restore the previous resolution behavior without data migration.
-
-## Activity feed pagination
-
-The activity feed is a privileged read surface: it exposes wallet, payment, and
-account-abstraction history. Pagination must be cursor-based and authorized.
-
-### Request contract
-
-- `limit` — integer, `1..100` (default `25`). Values outside the range are
-  rejected with `ACTIVITY_INVALID_LIMIT`; oversized batches are never silently
-  truncated.
-- `cursor` — opaque, server-issued token. Clients must treat it as opaque and
-  must not construct or mutate it. Malformed cursors are rejected with
-  `ACTIVITY_INVALID_CURSOR`.
-
-### Response contract
-
-- `items` — array of activity entries for the requested page.
-- `nextCursor` — opaque token for the next page, or `null` when exhausted.
-- `hasMore` — boolean mirror of `nextCursor !== null`.
-
-Cursors are stable and monotonic: a cursor issued for a page continues to
-resolve to the same position even as new activity is appended, so clients never
-skip or duplicate entries across concurrent requests.
-
-### Authorization
-
-Every activity feed request is authorized before any data is read. The caller
-must present a valid session (JWT) and hold one of the following roles for the
-requested account:
-
-- **owner** — full access to their own activity.
-- **delegate** — access only while the delegation is active and
+| `WAL
