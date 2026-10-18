@@ -14,6 +14,7 @@ import {
 	forwardCredentialHeaders,
 	hasCredential,
 	isCsrfSafe,
+	resolveCredentialSubject,
 } from "@/lib/http/credentials";
 import {
 	classifyServiceUnavailable,
@@ -145,7 +146,10 @@ export async function POST(request: Request): Promise<NextResponse> {
 		);
 	}
 
-	const rateKey = callerKey(request);
+	// Key the limiter on the verified subject so a caller cannot rotate a
+	// spoofable header to obtain a fresh window on every request.
+	const subject = resolveCredentialSubject(request);
+	const rateKey = callerKey(request, subject);
 	const decision = limiter.check(rateKey);
 	if (!decision.allowed) {
 		return errorResponse(
@@ -341,12 +345,70 @@ export async function POST(request: Request): Promise<NextResponse> {
 			);
 		}
 
+		if (upstream.status === 401 || upstream.status === 403) {
+			return errorResponse(
+				upstream.status,
+				SEND_ERROR_CODES.FORBIDDEN,
+				"The credential is not authorized to send.",
+				correlationId,
+				{},
+				gate.network,
+			);
+		}
+
 		const code = upstreamCode(upstreamBody);
 		if (code === "insufficient_funds") {
 			return errorResponse(
 				402,
 				SEND_ERROR_CODES.INSUFFICIENT_FUNDS,
 				"Insufficient funds for this send.",
+				correlationId,
+				{},
+				gate.network,
+			);
+		}
+
+		if (upstream.status === 400 || upstream.status === 422) {
+			return errorResponse(
+				400,
+				SEND_ERROR_CODES.INVALID_INPUT,
+				"The send request was rejected.",
+				correlationId,
+				{},
+				gate.network,
+			);
+		}
+				gate.network,
+			);
+		}
+
+		if (upstream.status === 401 || upstream.status === 403) {
+			return errorResponse(
+				upstream.status,
+				SEND_ERROR_CODES.FORBIDDEN,
+				"The credential is not authorized to send.",
+				correlationId,
+				{},
+				gate.network,
+			);
+		}
+
+		const code = upstreamCode(upstreamBody);
+		if (code === "insufficient_funds") {
+			return errorResponse(
+				402,
+				SEND_ERROR_CODES.INSUFFICIENT_FUNDS,
+				"Insufficient funds for this send.",
+				correlationId,
+				{},
+				gate.network,
+			);
+		}
+		if (upstream.status === 400 || upstream.status === 422) {
+			return errorResponse(
+				400,
+				SEND_ERROR_CODES.INVALID_INPUT,
+				"The send request was rejected.",
 				correlationId,
 				{},
 				gate.network,
@@ -367,18 +429,34 @@ export async function POST(request: Request): Promise<NextResponse> {
 				403,
 				SEND_ERROR_CODES.FORBIDDEN,
 				"This credential is not allowed to send.",
+				c
 				correlationId,
 				{},
 				gate.network,
 			);
 		}
-		if (code === "invalid_input" || upstream.status === 400) {
+		const code = upstreamCode(upstreamBody);
+		if (code === "insufficient_funds") {
+			return errorResponse(
+				402,
+				SEND_ERROR_CODES.INSUFFICIENT_FUNDS,
+				"Insufficient funds for this send.",
+				correlationId,
+				{},
+				gate.network,
+			);
+		}
+		if (upstream.status === 400 || upstream.status === 422) {
 			return errorResponse(
 				400,
 				SEND_ERROR_CODES.INVALID_INPUT,
-				"Request body is malformed.",
+				"The send request was rejected.",
 				correlationId,
 				{},
+				gate.network,
+			);
+		}
+
 				gate.network,
 			);
 		}
@@ -386,7 +464,7 @@ export async function POST(request: Request): Promise<NextResponse> {
 		return errorResponse(
 			502,
 			SEND_ERROR_CODES.UPSTREAM_ERROR,
-			"The send result could not be confirmed. Check activity before retrying.",
+			`Upstream send failed${upstreamCode(upstreamBody) ? `: ${upstreamCode(upstreamBody)}` : ""}.`,
 			correlationId,
 			{},
 			gate.network,
